@@ -3,6 +3,8 @@ resolve.py: a recursive resolver built using dnspython
 """
 
 import argparse
+from ast import For
+from urllib import error, response
 
 import dns.message
 import dns.name
@@ -10,6 +12,10 @@ import dns.query
 import dns.rdata
 import dns.rdataclass
 import dns.rdatatype
+import dns.flags
+from numpy import record
+import dns.exception
+import dns.rcode
 
 FORMATS = (("CNAME", "{alias} is an alias for {name}"),
            ("A", "{name} has address {address}"),
@@ -29,6 +35,14 @@ ROOT_SERVERS = ("198.41.0.4",
                 "193.0.14.129",
                 "199.7.83.42",
                 "202.12.27.33")
+
+
+
+# Cache completed DNS responses
+DNS_CACHE = {}
+
+# Cache intermediate DNS zone nameservers
+REFERRAL_CACHE = {}
 
 
 def collect_results(name: str) -> dict:
@@ -81,18 +95,273 @@ def collect_results(name: str) -> dict:
     return full_response
 
 
-def lookup(target_name: dns.name.Name,
-           qtype: dns.rdata.Rdata) -> dns.message.Message:
-    """
-    This function uses a recursive resolver to find the relevant answer to the
-    query.
+def get_ipv4_servers(response):
+    servers = []
 
-    TODO: replace this implementation with one which asks the root servers
-    and recurses to find the proper answer.
-    """
+    # Nameservers listed in the referral
+    ns_names = set()
+
+    for rrset in response.authority:
+        if rrset.rdtype == dns.rdatatype.NS:
+            for record in rrset:
+                ns_names.add(record.target)
+
+    # Extract matching IPv4 glue records
+    for rrset in response.additional:
+        if rrset.rdtype == dns.rdatatype.A:
+            if rrset.name in ns_names:
+                for record in rrset:
+                    servers.append(record.address)
+
+    return servers
+
+
+
+#def lookup(target_name: dns.name.Name,
+       #    qtype: dns.rdata.Rdata) -> dns.message.Message:
+   # """
+   # This function uses a recursive resolver to find the relevant answer to the
+   # query.
+
+  #  TODO: replace this implementation with one which asks the root servers
+   # and recurses to find the proper answer.
+  #  """
+    
+ 
+def lookup(target_name: dns.name.Name,
+           qtype: int,
+           seen_cnames=None,
+           resolving_ns=None) -> dns.message.Message:
+    
+    if resolving_ns is None:
+        resolving_ns = set()
+
+    # Step 1: Create the cache key
+    cache_key = (target_name.to_text().lower(), qtype)
+
+    # Step 2: Check completed DNS cache
+    if cache_key in DNS_CACHE:
+        print("CACHE HIT:", cache_key)
+        return DNS_CACHE[cache_key]
+
+    # Step 3: Create DNS question without recursion
     outbound_query = dns.message.make_query(target_name, qtype)
-    response = dns.query.udp(outbound_query, "8.8.8.8", 3)
-    return response
+    outbound_query.flags &= ~dns.flags.RD
+
+    # Step 4: Prevent CNAME loops
+    if seen_cnames is None:
+        seen_cnames = set()
+
+    name_key = target_name.to_text().lower()
+
+    if name_key in seen_cnames or len(seen_cnames) >= 16:
+        print("CNAME loop detected:", target_name)
+        return dns.message.make_response(outbound_query)
+
+    seen_cnames.add(name_key)
+
+    # Step 5: Check for cached nameservers
+    matching_zones = [
+        zone for zone in REFERRAL_CACHE
+        if target_name.is_subdomain(zone)
+    ]
+
+    if matching_zones:
+        # Pick the most specific cached DNS zone
+        zone = max(matching_zones, key=lambda z: len(z.labels))
+
+        print("USING REFERRAL CACHE:", zone)
+
+        # Start with cached servers, keep roots as fallback
+        servers = list(REFERRAL_CACHE[zone]) + list(ROOT_SERVERS)
+    else:
+        servers = list(ROOT_SERVERS)
+
+    visited = set()
+
+    # Step 6: Query DNS servers
+    while servers:
+        server_ip = servers.pop(0)
+
+        if server_ip in visited:
+            continue
+
+        visited.add(server_ip)
+
+        
+        try:
+            # Send DNS query with a 3-second timeout
+            response = dns.query.udp(
+                outbound_query,
+                server_ip,
+                timeout=3
+            )
+
+        except dns.exception.Timeout:
+            print("TIMEOUT: Server did not respond:", server_ip)
+            continue
+
+        except (dns.exception.DNSException, OSError) as error:
+            print("SERVER ERROR:", server_ip, error)
+            continue
+
+        print("QUERYING:", server_ip)
+
+        # Check for incomplete (truncated) responses
+        if response.flags & dns.flags.TC:
+            print("TRUNCATED RESPONSE:", server_ip)
+            continue
+
+        # Check DNS response status
+        status = response.rcode()
+
+        if status == dns.rcode.NXDOMAIN:
+            # The domain does not exist, if confirmed
+            # by an authoritative server
+            if response.flags & dns.flags.AA:
+                DNS_CACHE[cache_key] = response
+                return response
+
+            continue
+
+        if status != dns.rcode.NOERROR:
+            print(
+                "DNS ERROR:",
+                dns.rcode.to_text(status),
+                "FROM:",
+                server_ip
+            )
+            continue
+
+
+       
+
+        # Step 7: Check returned answers
+        if response.answer:
+
+            has_requested_type = any(
+                rrset.rdtype == qtype
+                for rrset in response.answer
+            )
+
+            if has_requested_type:
+                DNS_CACHE[cache_key] = response
+                return response
+
+            # Step 8: Handle CNAME restart
+            for rrset in response.answer:
+
+                if rrset.rdtype == dns.rdatatype.CNAME:
+
+                    for record in rrset:
+                        print("CNAME FOUND:", rrset.name)
+                        print("POINTS TO:", record.target)
+
+                        
+                        alias_response = lookup(
+                            record.target,
+                            qtype,
+                            seen_cnames,
+                            resolving_ns
+                        )
+
+                        # Check whether the CNAME target lookup succeeded
+                        if alias_response.rcode() != dns.rcode.NOERROR:
+                            print("CNAME target resolution failed:", record.target)
+
+                            failure_response = dns.message.make_response(outbound_query)
+                            failure_response.set_rcode(alias_response.rcode())
+
+                            return failure_response
+
+                            # Combine the CNAME with the target's records
+                        response.answer.extend(alias_response.answer)
+
+                            # Cache the completed result
+                        DNS_CACHE[cache_key] = response
+
+                        return response
+
+
+        # Step 9: Handle authoritative empty answers
+        if response.flags & dns.flags.AA:
+            DNS_CACHE[cache_key] = response
+            return response
+
+        # Step 10: Extract and cache DNS referrals
+        next_servers = get_ipv4_servers(response)
+
+        # Handle referrals without IPv4 glue records
+        if not next_servers:
+
+            for rrset in response.authority:
+
+                if rrset.rdtype != dns.rdatatype.NS:
+                    continue
+
+                for ns_record in rrset:
+                    ns_name = ns_record.target
+
+                    # Prevent circular nameserver resolution
+                    if ns_name in resolving_ns:
+                        continue
+
+                    print("UNGLUED NAMESERVER:", ns_name)
+
+                    resolving_ns.add(ns_name)
+
+                    try:
+                        # Find the nameserver's IPv4 address
+                        ns_response = lookup(
+                            ns_name,
+                            dns.rdatatype.A,
+                            resolving_ns=resolving_ns
+                        )
+
+                        # Extract A records from the result
+                        for a_rrset in ns_response.answer:
+                            if a_rrset.rdtype == dns.rdatatype.A:
+                                for a_record in a_rrset:
+                                    next_servers.append(a_record.address)
+
+                    finally:
+                        resolving_ns.remove(ns_name)
+
+
+        for rrset in response.authority:
+            if rrset.rdtype == dns.rdatatype.NS:
+
+                if next_servers:
+                    REFERRAL_CACHE[rrset.name] = next_servers.copy()
+
+                    print("REFERRAL CACHE SAVED:", rrset.name)
+
+        # Step 11: Follow the referral
+        if next_servers:
+            print("FOLLOWING REFERRAL:", next_servers)
+            servers = next_servers + servers
+            continue
+
+    # Step 12: Handle unsuccessful lookup
+    # All available DNS servers have been exhausted
+    print(
+        "ERROR: Unable to resolve",
+        target_name,
+     "after trying available DNS servers."
+    )
+
+    # Return a response indicating server failure
+    failure_response = dns.message.make_response(outbound_query)
+    failure_response.set_rcode(dns.rcode.SERVFAIL)
+
+    return failure_response
+
+
+
+
+
+
+
 
 
 def print_results(results: dict) -> None:
