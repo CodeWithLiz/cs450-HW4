@@ -13,7 +13,7 @@ import dns.rdata
 import dns.rdataclass
 import dns.rdatatype
 import dns.flags
-from numpy import record
+#from numpy import record
 import dns.exception
 import dns.rcode
 
