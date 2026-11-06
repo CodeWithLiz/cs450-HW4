@@ -96,11 +96,13 @@ def collect_results(name: str) -> dict:
 
 
 def get_ipv4_servers(response):
+    
     servers = []
 
     # Nameservers listed in the referral
     ns_names = set()
 
+    # collect nameserver names from the authority section
     for rrset in response.authority:
         if rrset.rdtype == dns.rdatatype.NS:
             for record in rrset:
@@ -117,38 +119,31 @@ def get_ipv4_servers(response):
 
 
 
-#def lookup(target_name: dns.name.Name,
-       #    qtype: dns.rdata.Rdata) -> dns.message.Message:
-   # """
-   # This function uses a recursive resolver to find the relevant answer to the
-   # query.
-
-  #  TODO: replace this implementation with one which asks the root servers
-   # and recurses to find the proper answer.
-  #  """
-    
- 
 def lookup(target_name: dns.name.Name,
            qtype: int,
            seen_cnames=None,
            resolving_ns=None) -> dns.message.Message:
+
+    #  Resolve a name by starting at the root servers and following referrals.
+    # Returns the final DNS response (or a SERVFAIL response on failure).
     
+    #  Track nameservers being resolved (prevents infinite loops)
     if resolving_ns is None:
         resolving_ns = set()
 
-    # Step 1: Create the cache key
+    # Create the cache key
     cache_key = (target_name.to_text().lower(), qtype)
 
-    # Step 2: Check completed DNS cache
+    # return cahe 
     if cache_key in DNS_CACHE:
         print("CACHE HIT:", cache_key)
         return DNS_CACHE[cache_key]
 
-    # Step 3: Create DNS question without recursion
+    # Create DNS query question without recursion
     outbound_query = dns.message.make_query(target_name, qtype)
     outbound_query.flags &= ~dns.flags.RD
 
-    # Step 4: Prevent CNAME loops
+    # prevent CNAME loops
     if seen_cnames is None:
         seen_cnames = set()
 
@@ -160,14 +155,14 @@ def lookup(target_name: dns.name.Name,
 
     seen_cnames.add(name_key)
 
-    # Step 5: Check for cached nameservers
+    #  Check for cached nameservers
     matching_zones = [
         zone for zone in REFERRAL_CACHE
         if target_name.is_subdomain(zone)
     ]
 
     if matching_zones:
-        # Pick the most specific cached DNS zone
+        # pick the most specific cached DNS zone
         zone = max(matching_zones, key=lambda z: len(z.labels))
 
         print("USING REFERRAL CACHE:", zone)
@@ -175,14 +170,17 @@ def lookup(target_name: dns.name.Name,
         # Start with cached servers, keep roots as fallback
         servers = list(REFERRAL_CACHE[zone]) + list(ROOT_SERVERS)
     else:
+           # No cache, start at the root
         servers = list(ROOT_SERVERS)
 
     visited = set()
 
-    # Step 6: Query DNS servers
+    #  Query DNS servers
     while servers:
         server_ip = servers.pop(0)
 
+
+        #Skip servers already asked
         if server_ip in visited:
             continue
 
@@ -198,6 +196,7 @@ def lookup(target_name: dns.name.Name,
             )
 
         except dns.exception.Timeout:
+            # No reply, try next server
             print("TIMEOUT: Server did not respond:", server_ip)
             continue
 
@@ -207,7 +206,7 @@ def lookup(target_name: dns.name.Name,
 
         print("QUERYING:", server_ip)
 
-        # Check for incomplete (truncated) responses
+        # Check for incomplete responses
         if response.flags & dns.flags.TC:
             print("TRUNCATED RESPONSE:", server_ip)
             continue
@@ -236,7 +235,7 @@ def lookup(target_name: dns.name.Name,
 
        
 
-        # Step 7: Check returned answers
+        # Check returned answers
         if response.answer:
 
             has_requested_type = any(
@@ -248,7 +247,7 @@ def lookup(target_name: dns.name.Name,
                 DNS_CACHE[cache_key] = response
                 return response
 
-            # Step 8: Handle CNAME restart
+            # Handle CNAME restart
             for rrset in response.answer:
 
                 if rrset.rdtype == dns.rdatatype.CNAME:
@@ -283,12 +282,12 @@ def lookup(target_name: dns.name.Name,
                         return response
 
 
-        # Step 9: Handle authoritative empty answers
+        # handle authoritative empty answers
         if response.flags & dns.flags.AA:
             DNS_CACHE[cache_key] = response
             return response
 
-        # Step 10: Extract and cache DNS referrals
+        # Extract and cache DNS referrals
         next_servers = get_ipv4_servers(response)
 
         # Handle referrals without IPv4 glue records
@@ -336,13 +335,13 @@ def lookup(target_name: dns.name.Name,
 
                     print("REFERRAL CACHE SAVED:", rrset.name)
 
-        # Step 11: Follow the referral
+        # Follow the referral
         if next_servers:
             print("FOLLOWING REFERRAL:", next_servers)
             servers = next_servers + servers
             continue
 
-    # Step 12: Handle unsuccessful lookup
+    # Handle unsuccessful lookup
     # All available DNS servers have been exhausted
     print(
         "ERROR: Unable to resolve",
